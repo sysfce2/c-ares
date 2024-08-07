@@ -197,6 +197,21 @@ TEST_P(MockUDPChannelTest, TruncationRetry) {
   EXPECT_EQ("{'www.google.com' aliases=[] addrs=[1.2.3.4]}", ss.str());
 }
 
+TEST_P(MockUDPChannelTest, UTF8BadName) {
+  DNSPacket reply;
+  reply.set_response().set_aa()
+    .add_question(new DNSQuestion("españa.icom.museum", T_A))
+    .add_answer(new DNSARR("españa.icom.museum", 100, {2, 3, 4, 5}));
+  ON_CALL(server_, OnRequest("españa.icom.museum", T_A))
+    .WillByDefault(SetReply(&server_, &reply));
+
+  HostResult result;
+  ares_gethostbyname(channel_, "españa.icom.museum", AF_INET, HostCallback, &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  EXPECT_EQ(ARES_EBADNAME, result.status_);
+}
+
 static int sock_cb_count = 0;
 static int SocketConnectCallback(ares_socket_t fd, int type, void *data) {
   int rc = *(int*)data;
@@ -572,7 +587,7 @@ TEST_P(MockTCPChannelTest, MalformedResponse) {
   ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result);
   Process();
   EXPECT_TRUE(result.done_);
-  EXPECT_EQ(ARES_ETIMEOUT, result.status_);
+  EXPECT_EQ(ARES_EBADRESP, result.status_);
 }
 
 TEST_P(MockTCPChannelTest, FormErrResponse) {
@@ -802,6 +817,46 @@ TEST_P(MockChannelTest, SearchDomains) {
   EXPECT_EQ("{'www.third.gov' aliases=[] addrs=[2.3.4.5]}", ss.str());
 }
 
+TEST_P(CacheQueriesTest, SearchDomainsCache) {
+  DNSPacket nofirst;
+  nofirst.set_response().set_aa().set_rcode(NXDOMAIN)
+    .add_question(new DNSQuestion("www.first.com", T_A))
+    .add_auth(new DNSSoaRR("first.com", 600, "ns1.first.com", "admin.first.com", 123456, 3600, 3600, 3600, 3600));
+  EXPECT_CALL(server_, OnRequest("www.first.com", T_A))
+    .WillOnce(SetReply(&server_, &nofirst));
+  DNSPacket nosecond;
+  nosecond.set_response().set_aa().set_rcode(NXDOMAIN)
+    .add_question(new DNSQuestion("www.second.org", T_A))
+    .add_auth(new DNSSoaRR("second.org", 600, "ns1.second.org", "admin.second.org", 123456, 3600, 3600, 3600, 3600));
+  EXPECT_CALL(server_, OnRequest("www.second.org", T_A))
+    .WillOnce(SetReply(&server_, &nosecond));
+  DNSPacket yesthird;
+  yesthird.set_response().set_aa()
+    .add_question(new DNSQuestion("www.third.gov", T_A))
+    .add_answer(new DNSARR("www.third.gov", 0x0200, {2, 3, 4, 5}));
+  EXPECT_CALL(server_, OnRequest("www.third.gov", T_A))
+    .WillOnce(SetReply(&server_, &yesthird));
+
+  // First pass through should send the queries.  The EXPECT_CALL .WillOnce
+  // will make sure this only happens once (vs ON_CALL .WillByDefault)
+  HostResult result;
+  ares_gethostbyname(channel_, "www", AF_INET, HostCallback, &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  std::stringstream ss;
+  ss << result.host_;
+  EXPECT_EQ("{'www.third.gov' aliases=[] addrs=[2.3.4.5]}", ss.str());
+
+  // This pass should be fully served by cache and yield the same result
+  HostResult cacheresult;
+  ares_gethostbyname(channel_, "www", AF_INET, HostCallback, &cacheresult);
+  Process();
+  EXPECT_TRUE(cacheresult.done_);
+  std::stringstream sscache;
+  sscache << cacheresult.host_;
+  EXPECT_EQ("{'www.third.gov' aliases=[] addrs=[2.3.4.5]}", sscache.str());
+}
+
 // Relies on retries so is UDP-only
 TEST_P(MockUDPChannelTest, SearchDomainsWithResentReply) {
   DNSPacket nofirst;
@@ -861,6 +916,8 @@ TEST_P(MockChannelTest, SearchDomainsBare) {
   ares_gethostbyname(channel_, "www", AF_INET, HostCallback, &result);
   Process();
   EXPECT_TRUE(result.done_);
+  EXPECT_EQ(0, result.timeouts_);
+
   std::stringstream ss;
   ss << result.host_;
   EXPECT_EQ("{'www' aliases=[] addrs=[2.3.4.5]}", ss.str());
@@ -990,7 +1047,9 @@ TEST_P(MockChannelTest, SearchHighNdots) {
 
 // Test that performing an EDNS search with an OPT RR options value works. The
 // options value should be included on the requests to the mock server.
-TEST_P(MockEDNSChannelTest, SearchOptVal) {
+// We are going to do this only via TCP since this won't include the dynamically
+// generated DNS cookie that would otherwise mess with this result.
+TEST_P(MockTCPChannelTest, SearchOptVal) {
   /* Define the OPT RR options code and value to use. */
   unsigned short opt_opt = 3;
   unsigned char opt_val[] = { 'c', '-', 'a', 'r', 'e', 's' };
@@ -1109,7 +1168,6 @@ TEST_P(MockChannelTest, V4WorksV6Timeout) {
   EXPECT_EQ("{'www.google.com' aliases=[] addrs=[1.2.3.4]}", ss.str());
 }
 
-#ifndef CARES_SYMBOL_HIDING
 // Test case for Issue #662
 TEST_P(MockChannelTest, PartialQueryCancel) {
   std::vector<byte> nothing;
@@ -1132,7 +1190,6 @@ TEST_P(MockChannelTest, PartialQueryCancel) {
   EXPECT_TRUE(result.done_);
   EXPECT_EQ(ARES_ECANCELLED, result.status_);
 }
-#endif
 
 TEST_P(MockChannelTest, UnspecifiedFamilyV6) {
   DNSPacket rsp6;
@@ -1498,6 +1555,271 @@ TEST_P(MockChannelTest, GetHostByAddrDestroy) {
   EXPECT_EQ(0, result.timeouts_);
 }
 
+static const unsigned char *
+  fetch_server_cookie(const ares_dns_record_t *dnsrec, size_t *len)
+{
+  const ares_dns_rr_t *rr  = fetch_rr_opt(dnsrec);
+  const unsigned char *val = NULL;
+  *len                     = 0;
+
+  if (rr == NULL) {
+    return NULL;
+  }
+
+  if (!ares_dns_rr_get_opt_byid(rr, ARES_RR_OPT_OPTIONS, ARES_OPT_PARAM_COOKIE,
+                                &val, len)) {
+    return NULL;
+  }
+
+  if (*len <= 8) {
+    *len = 0;
+    return NULL;
+  }
+
+  *len -= 8;
+  val  += 8;
+  return val;
+}
+
+static const unsigned char *
+  fetch_client_cookie(const ares_dns_record_t *dnsrec, size_t *len)
+{
+  const ares_dns_rr_t *rr  = fetch_rr_opt(dnsrec);
+  const unsigned char *val = NULL;
+  *len                     = 0;
+
+  if (rr == NULL) {
+    return NULL;
+  }
+
+  if (!ares_dns_rr_get_opt_byid(rr, ARES_RR_OPT_OPTIONS, ARES_OPT_PARAM_COOKIE,
+                                &val, len)) {
+    return NULL;
+  }
+
+  if (*len < 8) {
+    *len = 0;
+    return NULL;
+  }
+
+  *len = 8;
+  return val;
+}
+
+TEST_P(MockUDPChannelTest, DNSCookieSingle) {
+  DNSPacket reply;
+  std::vector<byte> server_cookie = { 1, 2, 3, 4, 5, 6, 7, 8 };
+  reply.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}))
+    .add_additional(new DNSOptRR(0, 0, 0, 1280, { }, server_cookie, false));
+  EXPECT_CALL(server_, OnRequest("www.google.com", T_A))
+    .WillOnce(SetReply(&server_, &reply));
+
+  QueryResult result;
+  ares_query_dnsrec(channel_, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A, QueryCallback, &result, NULL);
+  Process();
+  EXPECT_TRUE(result.done_);
+  EXPECT_EQ(0, result.timeouts_);
+
+  size_t len;
+  const unsigned char *returned_cookie = fetch_server_cookie(result.dnsrec_.dnsrec_, &len);
+  EXPECT_EQ(len, server_cookie.size());
+  EXPECT_TRUE(memcmp(server_cookie.data(), returned_cookie, len) == 0);
+}
+
+TEST_P(MockUDPChannelTest, DNSCookieMissingAfterGood) {
+  std::vector<byte> server_cookie = { 1, 2, 3, 4, 5, 6, 7, 8 };
+  DNSPacket reply;
+  reply.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}))
+    .add_additional(new DNSOptRR(0, 0, 0, 1280, { }, server_cookie, false));
+  DNSPacket reply_nocookie;
+  reply_nocookie.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}))
+    .add_additional(new DNSOptRR(0, 0, 0, 1280, { }, { }, false));
+  DNSPacket reply_ensurecookie;
+  reply_ensurecookie.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}))
+    .add_additional(new DNSOptRR(0, 0, 0, 1280, { }, server_cookie, true));
+
+  EXPECT_CALL(server_, OnRequest("www.google.com", T_A))
+    .WillOnce(SetReply(&server_, &reply))
+    .WillOnce(SetReply(&server_, &reply_nocookie))
+    .WillOnce(SetReply(&server_, &reply_ensurecookie));
+
+  /* This test will establish the server supports cookies, then the next reply
+   * will be missing the server cookie and therefore be rejected and timeout, then
+   * an internal retry will occur and the cookie will be present again and it
+   * will be verified a server cookie was actually present that matches the
+   * server cookie. */
+  QueryResult result1;
+  ares_query_dnsrec(channel_, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A, QueryCallback, &result1, NULL);
+  Process();
+  EXPECT_TRUE(result1.done_);
+  EXPECT_EQ(0, result1.timeouts_);
+
+  QueryResult result2;
+  ares_query_dnsrec(channel_, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A, QueryCallback, &result2, NULL);
+  Process();
+  EXPECT_TRUE(result2.done_);
+  EXPECT_EQ(1, result2.timeouts_);
+
+  /* Client cookie should NOT have rotated */
+  size_t len1;
+  const unsigned char *client_cookie_1 = fetch_client_cookie(result1.dnsrec_.dnsrec_, &len1);
+  size_t len2;
+  const unsigned char *client_cookie_2 = fetch_client_cookie(result2.dnsrec_.dnsrec_, &len2);
+  EXPECT_EQ(len1, 8);
+  EXPECT_EQ(len1, len2);
+  EXPECT_TRUE(memcmp(client_cookie_1, client_cookie_2, len1) == 0);
+}
+
+
+TEST_P(MockUDPChannelTest, DNSCookieBadLen) {
+  std::vector<byte> server_cookie = { 1, 2, 3, 4, 5, 6, 7, 8 };
+  std::vector<byte> server_cookie_bad = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 0 };
+  DNSPacket reply;
+  reply.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}))
+    .add_additional(new DNSOptRR(0, 0, 0, 1280, { }, server_cookie, false));
+  DNSPacket reply_badcookielen;
+  reply_badcookielen.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}))
+    .add_additional(new DNSOptRR(0, 0, 0, 1280, { }, server_cookie_bad, false));
+
+  EXPECT_CALL(server_, OnRequest("www.google.com", T_A))
+    .WillOnce(SetReply(&server_, &reply_badcookielen))
+    .WillOnce(SetReply(&server_, &reply));
+
+  /* This test will send back a malformed cookie len, then when it times out and retry occurs will send back a valid cookie. */
+  QueryResult result1;
+  ares_query_dnsrec(channel_, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A, QueryCallback, &result1, NULL);
+  Process();
+  EXPECT_TRUE(result1.done_);
+  EXPECT_EQ(1, result1.timeouts_);
+}
+
+
+TEST_P(MockUDPChannelTest, DNSCookieServerRotate) {
+  std::vector<byte> server_cookie = { 1, 2, 3, 4, 5, 6, 7, 8 };
+  std::vector<byte> server_cookie_rotate = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF };
+
+  DNSPacket reply_cookie1;
+  reply_cookie1.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}))
+    .add_additional(new DNSOptRR(0, 0, 0, 1280, {}, server_cookie, false));
+  DNSPacket reply_cookie2_badcookie;
+  reply_cookie2_badcookie.set_response().set_aa().set_rcode(ARES_RCODE_BADCOOKIE & 0xF)
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}))
+    .add_additional(new DNSOptRR((ARES_RCODE_BADCOOKIE >> 4) & 0xFF, 0, 0, 1280, { }, server_cookie_rotate, false));
+  DNSPacket reply_cookie2;
+  reply_cookie2.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}))
+    .add_additional(new DNSOptRR(0, 0, 0, 1280, { }, server_cookie_rotate, true));
+
+  EXPECT_CALL(server_, OnRequest("www.google.com", T_A))
+    .WillOnce(SetReply(&server_, &reply_cookie1))
+    .WillOnce(SetReply(&server_, &reply_cookie2_badcookie))
+    .WillOnce(SetReply(&server_, &reply_cookie2));
+
+  /* This test will establish the server supports cookies, then the next reply
+   * the server returns BADCOOKIE indicating the cookie has rotated and
+   * returns a new cookie. Then the query will be automatically retried with
+   * the newly returned cookie. No timeouts should be indicated, and the
+   * client cookie should not rotate. */
+  QueryResult result1;
+  ares_query_dnsrec(channel_, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A, QueryCallback, &result1, NULL);
+  Process();
+  EXPECT_TRUE(result1.done_);
+  EXPECT_EQ(0, result1.timeouts_);
+
+  QueryResult result2;
+  ares_query_dnsrec(channel_, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A, QueryCallback, &result2, NULL);
+  Process();
+  EXPECT_TRUE(result2.done_);
+  EXPECT_EQ(0, result2.timeouts_);
+
+  /* Client cookie should NOT have rotated */
+  size_t len1;
+  const unsigned char *client_cookie_1 = fetch_client_cookie(result1.dnsrec_.dnsrec_, &len1);
+  size_t len2;
+  const unsigned char *client_cookie_2 = fetch_client_cookie(result2.dnsrec_.dnsrec_, &len2);
+  EXPECT_EQ(len1, 8);
+  EXPECT_EQ(len1, len2);
+  EXPECT_TRUE(memcmp(client_cookie_1, client_cookie_2, len1) == 0);
+}
+
+TEST_P(MockUDPChannelTest, DNSCookieSpoof) {
+  std::vector<byte> client_cookie = { 1, 2, 3, 4, 5, 6, 7, 8 };
+  std::vector<byte> server_cookie = { 1, 2, 3, 4, 5, 6, 7, 8 };
+
+  DNSPacket reply_spoof;
+  reply_spoof.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}))
+    .add_additional(new DNSOptRR(0, 0, 0, 1280, client_cookie, server_cookie, false));
+  DNSPacket reply;
+  reply.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}))
+    .add_additional(new DNSOptRR(0, 0, 0, 1280, { }, server_cookie, false));
+
+  EXPECT_CALL(server_, OnRequest("www.google.com", T_A))
+    .WillOnce(SetReply(&server_, &reply_spoof))
+    .WillOnce(SetReply(&server_, &reply));
+
+  /* This test will return a reply that doesn't have the same client cookie as
+   * was sent, this should result in a drop of the packet alltogether, then
+   * the library will retry and a proper result will be sent. */
+  QueryResult result;
+  ares_query_dnsrec(channel_, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A, QueryCallback, &result, NULL);
+  Process();
+  EXPECT_TRUE(result.done_);
+  EXPECT_EQ(1, result.timeouts_);
+}
+
+TEST_P(MockUDPChannelTest, DNSCookieTCPUpgrade) {
+  std::vector<byte> server_cookie = { 1, 2, 3, 4, 5, 6, 7, 8 };
+
+  DNSPacket reply_badcookie;
+  reply_badcookie.set_response().set_aa().set_rcode(ARES_RCODE_BADCOOKIE & 0xF)
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}))
+    .add_additional(new DNSOptRR((ARES_RCODE_BADCOOKIE >> 4) & 0xFF, 0, 0, 1280, { }, server_cookie, false));
+  DNSPacket reply;
+  reply.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 0x0100, {0x01, 0x02, 0x03, 0x04}))
+    .add_additional(new DNSOptRR(0, 0, 0, 1280, { }, { }, false));
+
+  EXPECT_CALL(server_, OnRequest("www.google.com", T_A))
+    .WillOnce(SetReply(&server_, &reply_badcookie))
+    .WillOnce(SetReply(&server_, &reply_badcookie))
+    .WillOnce(SetReply(&server_, &reply_badcookie))
+    .WillOnce(SetReply(&server_, &reply));
+
+  /* This test will establish the server supports cookies, but continuously
+   * returns BADCOOKIE which is an indicator that there is some form of
+   * AnyCast issue across servers, so it upgrades to TCP afterwards.  No
+   * timeouts are recorded as the queries are sent back-to-back as immediate
+   * reattempts after the response. */
+  QueryResult result;
+  ares_query_dnsrec(channel_, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A, QueryCallback, &result, NULL);
+  Process();
+  EXPECT_TRUE(result.done_);
+  EXPECT_EQ(0, result.timeouts_);
+}
+
+
 #ifndef WIN32
 TEST_P(MockChannelTest, HostAlias) {
   DNSPacket reply;
@@ -1606,20 +1928,6 @@ class NoRotateMultiMockTest : public MockMultiServerChannelTest {
   NoRotateMultiMockTest() : MockMultiServerChannelTest(nullptr, ARES_OPT_NOROTATE) {}
 };
 
-class ServerFailoverOptsMultiMockTest : public MockMultiServerChannelTest {
- public:
-  ServerFailoverOptsMultiMockTest()
-    : MockMultiServerChannelTest(FillOptions(&opts_),
-                                 ARES_OPT_SERVER_FAILOVER | ARES_OPT_NOROTATE) {}
-  static struct ares_options* FillOptions(struct ares_options *opts) {
-    memset(opts, 0, sizeof(struct ares_options));
-    opts->server_failover_opts.retry_chance = 1;
-    opts->server_failover_opts.retry_delay = 250;
-    return opts;
-  }
- private:
-  struct ares_options opts_;
-};
 
 TEST_P(NoRotateMultiMockTest, ThirdServer) {
   struct ares_options opts;
@@ -1740,10 +2048,30 @@ TEST_P(NoRotateMultiMockTest, ServerNoResponseFailover) {
   EXPECT_EQ("{'www.example.com' aliases=[] addrs=[2.3.4.5]}", ss4.str());
 }
 
+#if defined(_WIN32)
+#  define SERVER_FAILOVER_RETRY_DELAY 500
+#else
+#  define SERVER_FAILOVER_RETRY_DELAY 330
+#endif
+class ServerFailoverOptsMultiMockTest : public MockMultiServerChannelTest {
+ public:
+  ServerFailoverOptsMultiMockTest()
+    : MockMultiServerChannelTest(FillOptions(&opts_),
+                                 ARES_OPT_SERVER_FAILOVER | ARES_OPT_NOROTATE) {}
+  static struct ares_options* FillOptions(struct ares_options *opts) {
+    memset(opts, 0, sizeof(struct ares_options));
+    opts->server_failover_opts.retry_chance = 1;
+    opts->server_failover_opts.retry_delay = SERVER_FAILOVER_RETRY_DELAY;
+    return opts;
+  }
+ private:
+  struct ares_options opts_;
+};
+
 // Test case to trigger server failover behavior. We use a retry chance of
-// 100% and a retry delay of 250ms so that we can test behavior reliably.
+// 100% and a retry delay so that we can test behavior reliably.
 TEST_P(ServerFailoverOptsMultiMockTest, ServerFailoverOpts) {
-  DNSPacket servfailrsp;
+ DNSPacket servfailrsp;
   servfailrsp.set_response().set_aa().set_rcode(SERVFAIL)
     .add_question(new DNSQuestion("www.example.com", T_A));
   DNSPacket okrsp;
@@ -1751,7 +2079,12 @@ TEST_P(ServerFailoverOptsMultiMockTest, ServerFailoverOpts) {
     .add_question(new DNSQuestion("www.example.com", T_A))
     .add_answer(new DNSARR("www.example.com", 100, {2,3,4,5}));
 
+  auto tv_begin = std::chrono::high_resolution_clock::now();
+  auto tv_now   = std::chrono::high_resolution_clock::now();
+  unsigned int delay_ms;
+
   // 1. If all servers are healthy, then the first server should be selected.
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: First server should be selected" << std::endl;
   EXPECT_CALL(*servers_[0], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[0].get(), &okrsp));
   CheckExample();
@@ -1759,16 +2092,23 @@ TEST_P(ServerFailoverOptsMultiMockTest, ServerFailoverOpts) {
   // 2. Failed servers should be retried after the retry delay.
   //
   // Fail server #0 but leave server #1 as healthy.
+  tv_now = std::chrono::high_resolution_clock::now();
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: Server0 will fail but leave Server1 as healthy" << std::endl;
   EXPECT_CALL(*servers_[0], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[0].get(), &servfailrsp));
   EXPECT_CALL(*servers_[1], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[1].get(), &okrsp));
   CheckExample();
 
-  // Sleep for the retry delay (actually a little more than 250ms to account
+  // Sleep for the retry delay (actually a little more than the retry delay to account
   // for unreliable timing, e.g. NTP slew) and send in another query. Server #0
   // should be retried.
-  std::this_thread::sleep_for(std::chrono::milliseconds(260));
+  tv_now = std::chrono::high_resolution_clock::now();
+  delay_ms = SERVER_FAILOVER_RETRY_DELAY + (SERVER_FAILOVER_RETRY_DELAY / 10);
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: sleep " << delay_ms << "ms" << std::endl;
+  ares_sleep_time(delay_ms);
+  tv_now = std::chrono::high_resolution_clock::now();
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: Server0 should be past retry delay and should be tried again successfully" << std::endl;
   EXPECT_CALL(*servers_[0], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[0].get(), &okrsp));
   CheckExample();
@@ -1778,6 +2118,8 @@ TEST_P(ServerFailoverOptsMultiMockTest, ServerFailoverOpts) {
   //
   // Fail all servers for the first round of tries. On the second round server
   // #1 responds successfully.
+  tv_now = std::chrono::high_resolution_clock::now();
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: All 3 servers will fail on the first attempt. On second attempt, Server0 will fail, but Server1 will answer correctly." << std::endl;
   EXPECT_CALL(*servers_[0], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[0].get(), &servfailrsp))
     .WillOnce(SetReply(servers_[0].get(), &servfailrsp));
@@ -1791,20 +2133,36 @@ TEST_P(ServerFailoverOptsMultiMockTest, ServerFailoverOpts) {
   // At this point the sorted servers look like [1] (f0) [2] (f1) [0] (f2).
   // Sleep for the retry delay and send in another query. Server #2 should be
   // retried first, and then server #0.
-  std::this_thread::sleep_for(std::chrono::milliseconds(260));
+  tv_now = std::chrono::high_resolution_clock::now();
+  delay_ms = SERVER_FAILOVER_RETRY_DELAY + (SERVER_FAILOVER_RETRY_DELAY / 10);
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: sleep " << delay_ms << "ms" << std::endl;
+  ares_sleep_time(delay_ms);
+  tv_now = std::chrono::high_resolution_clock::now();
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: Past retry delay, so will choose Server2 and Server0 that are down. Server2 will fail but Server0 will succeed." << std::endl;
   EXPECT_CALL(*servers_[2], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[2].get(), &servfailrsp));
   EXPECT_CALL(*servers_[0], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[0].get(), &okrsp));
   CheckExample();
 
+  // Test might take a while to run and the sleep may not be accurate, so we
+  // want to track this interval otherwise we may not pass the last test case
+  // on slow systems.
+  auto elapse_start = tv_now;
+
   // 4. If there are multiple failed servers, then servers which have not yet
   //    met the retry delay should be skipped.
   //
   // The sorted servers currently look like [0] (f0) [1] (f0) [2] (f2) and
   // server #2 has just been retried.
-  // Sleep for half the retry delay and trigger a failure on server #0.
-  std::this_thread::sleep_for(std::chrono::milliseconds(130));
+  // Sleep for 1/2 the retry delay and trigger a failure on server #0.
+  tv_now = std::chrono::high_resolution_clock::now();
+  delay_ms = (SERVER_FAILOVER_RETRY_DELAY/2);
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: sleep " << delay_ms << "ms" << std::endl;
+  ares_sleep_time(delay_ms);
+  tv_now = std::chrono::high_resolution_clock::now();
+
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: Retry delay has not been hit yet. Server0 was last successful, so should be tried first (and will fail), Server1 is also healthy so will respond." << std::endl;
   EXPECT_CALL(*servers_[0], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[0].get(), &servfailrsp));
   EXPECT_CALL(*servers_[1], OnRequest("www.example.com", T_A))
@@ -1812,10 +2170,22 @@ TEST_P(ServerFailoverOptsMultiMockTest, ServerFailoverOpts) {
   CheckExample();
 
   // The sorted servers now look like [1] (f0) [0] (f1) [2] (f2). Server #0
-  // has just failed whilst server #2 is halfway through the retry delay.
-  // Sleep for another half the retry delay and check that server #2 is retried
-  // whilst server #0 is not.
-  std::this_thread::sleep_for(std::chrono::milliseconds(130));
+  // has just failed whilst server #2 is somewhere in its retry delay.
+  // Sleep until we know server #2s retry delay has elapsed but Server #0 has
+  // not.
+  tv_now = std::chrono::high_resolution_clock::now();
+
+  unsigned int elapsed_time = (unsigned int)std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - elapse_start).count();
+  delay_ms = (SERVER_FAILOVER_RETRY_DELAY) + (SERVER_FAILOVER_RETRY_DELAY / 10);
+  if (elapsed_time > delay_ms) {
+    if (verbose) std::cerr << "elapsed duration " << elapsed_time << "ms greater than desired delay of " << delay_ms << "ms, not sleeping" << std::endl;
+  } else {
+    delay_ms -= elapsed_time; // subtract already elapsed time
+    if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: sleep " << delay_ms << "ms" << std::endl;
+    ares_sleep_time(delay_ms);
+  }
+  tv_now = std::chrono::high_resolution_clock::now();
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: Retry delay has expired on Server2 but not Server0, will try on Server2 and fail, then Server1 will answer" << std::endl;
   EXPECT_CALL(*servers_[2], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[2].get(), &servfailrsp));
   EXPECT_CALL(*servers_[1], OnRequest("www.example.com", T_A))

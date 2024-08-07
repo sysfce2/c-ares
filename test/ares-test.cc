@@ -41,7 +41,7 @@ extern "C" {
 #include "ares_setup.h"
 #include "ares_inet_net_pton.h"
 #include "ares_data.h"
-#include "ares_strsplit.h"
+#include "str/ares_strsplit.h"
 #include "ares_private.h"
 }
 
@@ -59,6 +59,7 @@ extern "C" {
 #include <functional>
 #include <sstream>
 #include <algorithm>
+#include <chrono>
 
 #ifdef WIN32
 #define BYTE_CAST (char *)
@@ -250,6 +251,16 @@ unsigned long long LibraryTest::fails_ = 0;
 std::map<size_t, int> LibraryTest::size_fails_;
 std::mutex            LibraryTest::lock_;
 
+void ares_sleep_time(unsigned int ms)
+{
+  auto duration   = std::chrono::milliseconds(ms);
+  auto start_time = std::chrono::high_resolution_clock::now();
+  auto wake_time  = start_time + duration;
+  std::this_thread::sleep_until(wake_time);
+  auto end_time   = std::chrono::high_resolution_clock::now();
+  if (verbose) std::cerr << "sleep requested " << ms << "ms, slept for " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() << "ms" << std::endl;
+}
+
 void ProcessWork(ares_channel_t *channel,
                  std::function<std::set<ares_socket_t>()> get_extrafds,
                  std::function<void(ares_socket_t)> process_extra,
@@ -257,32 +268,15 @@ void ProcessWork(ares_channel_t *channel,
   int nfds, count;
   fd_set readers, writers;
 
-#ifndef CARES_SYMBOL_HIDING
-  ares_timeval_t tv_begin;
-  ares_timeval_t tv_cancel;
-
-  ares__tvnow(&tv_begin);
-  memcpy(&tv_cancel, &tv_begin, sizeof(tv_cancel));
+  auto tv_begin = std::chrono::high_resolution_clock::now();
+  auto tv_cancel = tv_begin;
 
   if (cancel_ms) {
     if (verbose) std::cerr << "ares_cancel will be called after " << cancel_ms << "ms" << std::endl;
-    tv_cancel.sec  += (cancel_ms / 1000);
-    tv_cancel.usec += ((cancel_ms % 1000) * 1000);
+    tv_cancel += std::chrono::milliseconds(cancel_ms);
   }
-#else
-  if (cancel_ms) {
-    std::cerr << "library built with symbol hiding, can't test with cancel support" << std::endl;
-    return;
-  }
-#endif
 
   while (true) {
-#ifndef CARES_SYMBOL_HIDING
-    ares_timeval_t  tv_now;
-    ares_timeval_t  atv_remaining;
-
-    ares__tvnow(&tv_now);
-#endif
     struct timeval  tv;
     struct timeval *tv_select;
 
@@ -308,29 +302,24 @@ void ProcessWork(ares_channel_t *channel,
     if (tv_select == NULL)
       return;
 
-#ifndef CARES_SYMBOL_HIDING
     if (cancel_ms) {
-      unsigned int remaining_ms;
-      ares__timeval_remaining(&atv_remaining,
-                              &tv_now,
-                              &tv_cancel);
+      auto tv_now       = std::chrono::high_resolution_clock::now();
+      auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tv_cancel - tv_now).count();
 
-      remaining_ms = (unsigned int)((atv_remaining.sec * 1000) + (atv_remaining.usec / 1000));
-      if (remaining_ms == 0) {
+      if (remaining_ms <= 0) {
         if (verbose) std::cerr << "Issuing ares_cancel()" << std::endl;
         ares_cancel(channel);
         cancel_ms = 0; /* Disable issuing cancel again */
       } else {
         struct timeval tv_remaining;
 
-        tv_remaining.tv_sec = atv_remaining.sec;
-        tv_remaining.tv_usec = (int)atv_remaining.usec;
+        tv_remaining.tv_sec = remaining_ms / 1000;
+        tv_remaining.tv_usec = (int)(remaining_ms % 1000);
 
         /* Recalculate proper timeout since we also have a cancel to wait on */
         tv_select = ares_timeout(channel, &tv_remaining, &tv);
       }
     }
-#endif
 
     count = select(nfds, &readers, &writers, nullptr, tv_select);
     if (count < 0) {
@@ -444,10 +433,27 @@ MockServer::MockServer(int family, unsigned short port)
   // Send TCP data right away.
   setsockopt(tcpfd_, IPPROTO_TCP, TCP_NODELAY,
              BYTE_CAST &optval , sizeof(int));
+#if defined(SO_NOSIGPIPE)
+  setsockopt(tcpfd_, SOL_SOCKET, SO_NOSIGPIPE, (void *)&optval, sizeof(optval));
+#endif
+
+  /* Test system enable TCP FastOpen */
+#if defined(TCP_FASTOPEN)
+#  ifdef __linux__
+  int qlen = 32;
+  setsockopt(tcpfd_, IPPROTO_TCP, TCP_FASTOPEN, &qlen, sizeof(qlen));
+#  else
+  int on = 1;
+  setsockopt(tcpfd_, IPPROTO_TCP, TCP_FASTOPEN, BYTE_CAST &on, sizeof(on));
+#  endif
+#endif
 
   // Create a UDP socket to receive data on.
   udpfd_ = socket(family, SOCK_DGRAM, 0);
   EXPECT_NE(ARES_SOCKET_BAD, udpfd_);
+#if defined(SO_NOSIGPIPE)
+  setsockopt(udpfd_, SOL_SOCKET, SO_NOSIGPIPE, (void *)&optval, sizeof(optval));
+#endif
 
   // Bind the sockets to the given port.
   if (family == AF_INET) {
@@ -601,7 +607,7 @@ void MockServer::ProcessPacket(ares_socket_t fd, struct sockaddr_storage *addr, 
     std::cerr << "ProcessRequest(" << qid << ", '" << name
               << "', " << RRTypeToString(rrtype) << ")" << std::endl;
   }
-  ProcessRequest(fd, addr, addrlen, reqstr, qid, name, rrtype);
+  ProcessRequest(fd, addr, addrlen, req, reqstr, qid, name, rrtype);
   ares_free_string(name);
 }
 
@@ -671,11 +677,13 @@ std::set<ares_socket_t> MockServer::fds() const {
 }
 
 void MockServer::ProcessRequest(ares_socket_t fd, struct sockaddr_storage* addr,
-                                ares_socklen_t addrlen, const std::string &reqstr,
+                                ares_socklen_t addrlen, const std::vector<byte> &req,
+                                const std::string &reqstr,
                                 int qid, const char *name, int rrtype) {
 
   /* DNS 0x20 will mix case, do case-insensitive matching of name in request */
   char lower_name[256];
+  int flags = 0;
   arestest_strtolower(lower_name, name, sizeof(lower_name));
 
   // Before processing, let gMock know the request is happening.
@@ -687,7 +695,17 @@ void MockServer::ProcessRequest(ares_socket_t fd, struct sockaddr_storage* addr,
   }
 
   if (reply_ != nullptr) {
-    exact_reply_ = reply_->data(name);
+    ares_dns_record_t *dnsrec = NULL;
+    /* We will *attempt* to parse the request string.  It may be malformed that
+     * will lead to a parse failure.  If so, we just ignore it.  We want to
+     * pass this parsed data structure to the reply generator in case it needs
+     * to extract metadata (such as a DNS client cookie) from the original
+     * request.  If we can't parse it, oh well, we'll just pass NULL, most
+     * replies don't need anything from the request other than the name which
+     * is passed separately. */
+    ares_dns_parse(req.data(), req.size(), 0, &dnsrec);
+    exact_reply_ = reply_->data(name, dnsrec);
+    ares_dns_record_destroy(dnsrec);
   }
 
   if (exact_reply_.size() == 0) {
@@ -722,7 +740,11 @@ void MockServer::ProcessRequest(ares_socket_t fd, struct sockaddr_storage* addr,
     addrlen = 0;
   }
 
-  ares_ssize_t rc = (ares_ssize_t)sendto(fd, BYTE_CAST reply.data(), (SEND_TYPE_ARG3)reply.size(), 0,
+#ifdef MSG_NOSIGNAL
+  flags |= MSG_NOSIGNAL;
+#endif
+
+  ares_ssize_t rc = (ares_ssize_t)sendto(fd, BYTE_CAST reply.data(), (SEND_TYPE_ARG3)reply.size(), flags,
                   (struct sockaddr *)addr, addrlen);
   if (rc < static_cast<ares_ssize_t>(reply.size())) {
     std::cerr << "Failed to send full reply, rc=" << rc << std::endl;
@@ -877,31 +899,17 @@ void MockChannelOptsTest::Process(unsigned int cancel_ms) {
 void MockEventThreadOptsTest::Process(unsigned int cancel_ms) {
   std::set<ares_socket_t> fds;
 
-#ifndef CARES_SYMBOL_HIDING
-  bool has_cancel_ms = (cancel_ms > 0)?true:false;
-  ares_timeval_t tv_begin;
-  ares_timeval_t tv_cancel;
-#endif
+  auto tv_begin = std::chrono::high_resolution_clock::now();
+  auto tv_cancel = tv_begin;
 
-#ifndef CARES_SYMBOL_HIDING
-  ares_timeval_t tv_now;
-  ares_timeval_t atv_remaining;
-
-  if (has_cancel_ms) {
-    ares__tvnow(&tv_begin);
-    memcpy(&tv_cancel, &tv_begin, sizeof(tv_cancel));
-    if (verbose) std::cerr << "ares_cancel will be called after " << cancel_ms << "ms" << std::endl;
-    tv_cancel.sec  += (cancel_ms / 1000);
-    tv_cancel.usec += ((cancel_ms % 1000) * 1000);
-  }
-#else
   if (cancel_ms) {
-    std::cerr << "library built with symbol hiding, can't test with cancel support" << std::endl;
-    return;
+    if (verbose) std::cerr << "ares_cancel will be called after " << cancel_ms << "ms" << std::endl;
+    tv_cancel += std::chrono::milliseconds(cancel_ms);
   }
-#endif
 
   while (ares_queue_active_queries(channel_)) {
+    //if (verbose) std::cerr << "pending queries: " << ares_queue_active_queries(channel_) << std::endl;
+
     int nfds = 0;
     fd_set readers;
 
@@ -918,31 +926,24 @@ void MockEventThreadOptsTest::Process(unsigned int cancel_ms) {
       }
     }
 
-    /* We just always wait 20ms then recheck. Not doing any complex signaling. */
+    /* We just always wait 20ms then recheck if we're done. Not doing any
+     * complex signaling. */
     tv.tv_sec  = 0;
     tv.tv_usec = 20000;
 
-#ifndef CARES_SYMBOL_HIDING
-    ares__tvnow(&tv_now);
+    if (cancel_ms) {
+      auto tv_now       = std::chrono::high_resolution_clock::now();
+      auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tv_cancel - tv_now).count();
 
-    unsigned int remaining_ms = 0;
-    if (has_cancel_ms) {
-      ares__timeval_remaining(&atv_remaining,
-                              &tv_now,
-                              &tv_cancel);
-      remaining_ms = (unsigned int)((atv_remaining.sec * 1000) + (atv_remaining.usec / 1000));
-      if (remaining_ms == 0) {
+      if (remaining_ms <= 0) {
         if (verbose) std::cerr << "Issuing ares_cancel()" << std::endl;
         ares_cancel(channel_);
         cancel_ms = 0; /* Disable issuing cancel again */
-        has_cancel_ms = false;
+      } else {
+        tv.tv_sec = remaining_ms / 1000;
+        tv.tv_usec = (int)(remaining_ms % 1000);
       }
     }
-
-    if (has_cancel_ms && remaining_ms < 20) {
-      tv.tv_usec = (int)remaining_ms * 1000;
-    }
-#endif
 
     if (select(nfds, &readers, nullptr, nullptr, &tv) < 0) {
       fprintf(stderr, "select() failed, errno %d\n", errno);
@@ -956,6 +957,8 @@ void MockEventThreadOptsTest::Process(unsigned int cancel_ms) {
       }
     }
   }
+
+  //if (verbose) std::cerr << "pending queries at process end: " << ares_queue_active_queries(channel_) << std::endl;
 }
 
 std::ostream& operator<<(std::ostream& os, const HostResult& result) {
@@ -1040,6 +1043,44 @@ void HostCallback(void *data, int status, int timeouts,
   if (hostent)
     result->host_ = HostEnt(hostent);
   if (verbose) std::cerr << "HostCallback(" << *result << ")" << std::endl;
+}
+
+std::ostream& operator<<(std::ostream& os, const AresDnsRecord& dnsrec) {
+  os << "{'";
+  /* XXX: Todo */
+  os << '}';
+  return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const QueryResult& result) {
+  os << '{';
+  if (result.done_) {
+    os << StatusToString(result.status_);
+      if (result.dnsrec_.dnsrec_ != nullptr) {
+        os << " " << result.dnsrec_;
+      } else {
+        os << ", (no dnsrec)";
+      }
+  } else {
+    os << "(incomplete)";
+  }
+  os << '}';
+  return os;
+}
+
+void QueryCallback(void *data, ares_status_t status, size_t timeouts,
+                   const ares_dns_record_t *dnsrec) {
+  EXPECT_NE(nullptr, data);
+  if (data == nullptr)
+    return;
+
+  QueryResult* result = reinterpret_cast<QueryResult*>(data);
+  result->done_ = true;
+  result->status_ = status;
+  result->timeouts_ = timeouts;
+  if (dnsrec)
+    result->dnsrec_.SetDnsRecord(dnsrec);
+  if (verbose) std::cerr << "QueryCallback(" << *result << ")" << std::endl;
 }
 
 std::ostream& operator<<(std::ostream& os, const AddrInfoResult& result) {

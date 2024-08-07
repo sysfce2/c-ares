@@ -84,6 +84,8 @@ extern std::vector<std::tuple<ares_evsys_t, int>>       evsys_families;
 extern std::vector<std::pair<int, bool>>                families_modes;
 extern std::vector<std::tuple<ares_evsys_t, int, bool>> evsys_families_modes;
 
+// Hopefully a more accurate sleep than sleep_for()
+void                    ares_sleep_time(unsigned int ms);
 
 // Process all pending work on ares-owned file descriptors, plus
 // optionally the given set-of-FDs + work function.
@@ -218,7 +220,6 @@ protected:
   ares_channel_t *channel_;
 };
 
-
 // Mock DNS server to allow responses to be scripted by tests.
 class MockServer {
 public:
@@ -234,7 +235,7 @@ public:
   void SetReplyData(const std::vector<byte> &reply)
   {
     exact_reply_ = reply;
-    reply_ = nullptr;
+    reply_       = nullptr;
   }
 
   void SetReply(const DNSPacket *reply)
@@ -249,7 +250,7 @@ public:
   void SetReplyExpRequest(const DNSPacket *reply, const std::string &request)
   {
     expected_request_ = request;
-    reply_ = reply;
+    reply_            = reply;
   }
 
   void SetReplyQID(int qid)
@@ -289,8 +290,9 @@ public:
 
 private:
   void           ProcessRequest(ares_socket_t fd, struct sockaddr_storage *addr,
-                                ares_socklen_t addrlen, const std::string &reqstr,
-                                int qid, const char *name, int rrtype);
+                                ares_socklen_t addrlen, const std::vector<byte> &req,
+                                const std::string &reqstr, int qid, const char *name,
+                                int rrtype);
   void           ProcessPacket(ares_socket_t fd, struct sockaddr_storage *addr,
                                ares_socklen_t addrlen, byte *data, int len);
   unsigned short udpport_;
@@ -389,6 +391,7 @@ public:
   }
 
   void Process(unsigned int cancel_ms = 0);
+
 private:
   struct ares_options evopts_;
 };
@@ -494,6 +497,51 @@ struct HostResult {
 
 std::ostream &operator<<(std::ostream &os, const HostResult &result);
 
+// C++ wrapper for ares_dns_record_t.
+struct AresDnsRecord {
+  ~AresDnsRecord()
+  {
+    ares_dns_record_destroy(dnsrec_);
+    dnsrec_ = NULL;
+  }
+
+  AresDnsRecord() : dnsrec_(NULL)
+  {
+  }
+
+  void SetDnsRecord(const ares_dns_record_t *dnsrec)
+  {
+    if (dnsrec_ != NULL) {
+      ares_dns_record_destroy(dnsrec_);
+    }
+    if (dnsrec == NULL) {
+      return;
+    }
+    dnsrec_ = ares_dns_record_duplicate(dnsrec);
+  }
+
+  ares_dns_record_t *dnsrec_ = NULL;
+};
+
+std::ostream &operator<<(std::ostream &os, const AresDnsRecord &result);
+
+// Structure that describes the result of an ares_host_callback invocation.
+struct QueryResult {
+  QueryResult() : done_(false), status_(ARES_SUCCESS), timeouts_(0)
+  {
+  }
+
+  // Whether the callback has been invoked.
+  bool          done_;
+  // Explicitly provided result information.
+  ares_status_t status_;
+  size_t        timeouts_;
+  // Contents of the ares_dns_record_t structure if provided
+  AresDnsRecord dnsrec_;
+};
+
+std::ostream &operator<<(std::ostream &os, const QueryResult &result);
+
 // Structure that describes the result of an ares_callback invocation.
 struct SearchResult {
   // Whether the callback has been invoked.
@@ -554,6 +602,8 @@ std::ostream &operator<<(std::ostream &os, const AddrInfoResult &result);
 // structures.
 void          HostCallback(void *data, int status, int timeouts,
                            struct hostent *hostent);
+void          QueryCallback(void *data, ares_status_t status, size_t timeouts,
+                            const ares_dns_record_t *dnsrec);
 void SearchCallback(void *data, int status, int timeouts, unsigned char *abuf,
                     int alen);
 void SearchCallbackDnsRec(void *data, ares_status_t status, size_t timeouts,

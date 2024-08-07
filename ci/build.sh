@@ -1,7 +1,7 @@
 #!/bin/sh
 # Copyright (C) The c-ares project and its contributors
 # SPDX-License-Identifier: MIT
-set -e
+set -e -x
 
 OS=""
 if [ "$TRAVIS_OS_NAME" != "" ]; then
@@ -17,6 +17,7 @@ fi
 
 if [ "$BUILD_TYPE" = "autotools" -o "$BUILD_TYPE" = "coverage" ]; then
     autoreconf -fi
+    rm -rf atoolsbld
     mkdir atoolsbld
     cd atoolsbld
     if [ "$DIST" = "iOS" ] ; then
@@ -26,13 +27,21 @@ if [ "$BUILD_TYPE" = "autotools" -o "$BUILD_TYPE" = "coverage" ]; then
     fi
     export CFLAGS="${CFLAGS} -O0 -g"
     export CXXFLAGS="${CXXFLAGS} -O0 -g"
-    $SCAN_WRAP ../configure --disable-symbol-hiding --enable-maintainer-mode $CONFIG_OPTS
+    if [ "$DIST" != "Windows" ] ; then
+        CONFIG_OPTS="${CONFIG_OPTS} --disable-symbol-hiding"
+    fi
+    $SCAN_WRAP ../configure --enable-maintainer-mode $CONFIG_OPTS
     $SCAN_WRAP make
+    cd ..
 else
     # Use cmake for everything else
+    rm -rf cmakebld
+    mkdir cmakebld
+    cd cmakebld
     if [ "$DIST" = "iOS" ] ; then
         CMAKE_FLAGS="${CMAKE_FLAGS} -DCMAKE_OSX_SYSROOT=${SYSROOT}"
     fi
-    $SCAN_WRAP cmake ${CMAKE_FLAGS} ${CMAKE_TEST_FLAGS} -Bcmakebld .
-    $SCAN_WRAP cmake --build cmakebld
+    $SCAN_WRAP cmake ${CMAKE_FLAGS} ${CMAKE_TEST_FLAGS} ..
+    $SCAN_WRAP cmake --build .
+    cd ..
 fi

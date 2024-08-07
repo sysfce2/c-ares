@@ -336,7 +336,7 @@ TEST_F(DefaultChannelTest, HostByNameFileOnionDomain) {
 
 TEST_F(DefaultChannelTest, GetAddrinfoOnionDomain) {
   AddrInfoResult result;
-  struct ares_addrinfo_hints hints = {};
+  struct ares_addrinfo_hints hints = {0, 0, 0, 0};
   hints.ai_family = AF_UNSPEC;
   ares_getaddrinfo(channel_, "dontleak.onion", NULL, &hints, AddrInfoCallback, &result);
   EXPECT_TRUE(result.done_);
@@ -519,7 +519,7 @@ TEST_F(LibraryTest, CreateEDNSQuery) {
   std::string actual = PacketToString(data);
   DNSPacket pkt;
   pkt.set_qid(0x1234).add_question(new DNSQuestion("example.com", T_A))
-    .add_additional(new DNSOptRR(0, 1280));
+    .add_additional(new DNSOptRR(0, 0, 0, 1280, { }, { } /* No server cookie */, false));
   std::string expected = PacketToString(pkt.data());
   EXPECT_EQ(expected, actual);
 }

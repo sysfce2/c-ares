@@ -78,6 +78,40 @@ TEST_P(MockUDPEventThreadTest, GetHostByNameParallelLookups) {
   EXPECT_EQ("{'www.google.com' aliases=[] addrs=[2.3.4.5]}", ss3.str());
 }
 
+// c-ares issue #819
+TEST_P(MockUDPEventThreadTest, BadLoopbackServerNoTimeouts) {
+  ares_set_servers_csv(channel_, "127.0.0.1:12345");
+#define BADLOOPBACK_TESTCNT 5
+  HostResult result[BADLOOPBACK_TESTCNT];
+  for (size_t i=0; i<BADLOOPBACK_TESTCNT; i++) {
+    ares_gethostbyname(channel_, "www.google.com.", AF_UNSPEC, HostCallback, &result[i]);
+  }
+  Process();
+  for (size_t i=0; i<BADLOOPBACK_TESTCNT; i++) {
+    EXPECT_TRUE(result[i].done_);
+
+    /* This test relies on the ICMP unreachable packet coming back on UDP connections
+     * when there is no listener on the other end.  Most OS's handle this properly,
+     * but not all.  For instance, Solaris 11 seems to not be compliant (it
+     * does however honor it sometimes, just not always) so while we still run
+     * the test, we don't do a strict validation of the result.
+     *
+     * Windows also appears to have intermittent issues, AppVeyor fails but GitHub Actions
+     * succeeds, which seems strange.  This test goes to loopback so the network
+     * it resides on shouldn't matter.
+     *
+     * This test is really just testing an optimization, UDP is connectionless so you
+     * should expect most connections to rely on timeouts and not ICMP unreachable.
+     */
+# if defined(__sun) || defined(_WIN32) || defined(__NetBSD__)
+    EXPECT_TRUE(result[i].status_ == ARES_ECONNREFUSED || result[i].status_ == ARES_ETIMEOUT || result[i].status_ == ARES_ESERVFAIL);
+# else
+    EXPECT_EQ(ARES_ECONNREFUSED, result[i].status_);
+    EXPECT_EQ(0, result[i].timeouts_);
+#endif
+  }
+}
+
 // UDP to TCP specific test
 TEST_P(MockUDPEventThreadTest, TruncationRetry) {
   DNSPacket rsptruncated;
@@ -103,8 +137,8 @@ static int sock_cb_count = 0;
 static int SocketConnectCallback(ares_socket_t fd, int type, void *data) {
   int rc = *(int*)data;
   (void)type;
-  if (verbose) std::cerr << "SocketConnectCallback(" << fd << ") invoked" << std::endl;
   sock_cb_count++;
+  if (verbose) std::cerr << "SocketConnectCallback(fd: " << fd << ", cnt: " << sock_cb_count << ") invoked" << std::endl;
   return rc;
 }
 
@@ -214,6 +248,58 @@ TEST_P(MockUDPEventThreadMaxQueriesTest, GetHostByNameParallelLookups) {
     EXPECT_EQ("{'www.google.com' aliases=[] addrs=[2.3.4.5]}", ss.str());
   }
 }
+
+/* This test case is likely to fail in heavily loaded environments, it was
+ * there to stress the windows event system.  Not needed to be on normally */
+#if 0
+class MockUDPEventThreadSingleQueryPerConnTest
+    : public MockEventThreadOptsTest,
+      public ::testing::WithParamInterface<std::tuple<ares_evsys_t,int>> {
+ public:
+  MockUDPEventThreadSingleQueryPerConnTest()
+    : MockEventThreadOptsTest(1, std::get<0>(GetParam()), std::get<1>(GetParam()), false,
+                          FillOptions(&opts_),
+                          ARES_OPT_UDP_MAX_QUERIES) {}
+  static struct ares_options* FillOptions(struct ares_options * opts) {
+    memset(opts, 0, sizeof(struct ares_options));
+    opts->udp_max_queries = 1;
+    return opts;
+  }
+ private:
+  struct ares_options opts_;
+};
+
+#define LOTSOFCONNECTIONS_CNT 64
+TEST_P(MockUDPEventThreadSingleQueryPerConnTest, LotsOfConnections) {
+  DNSPacket rsp;
+  rsp.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 100, {2, 3, 4, 5}));
+  ON_CALL(server_, OnRequest("www.google.com", T_A))
+    .WillByDefault(SetReply(&server_, &rsp));
+
+  // Get notified of new sockets so we can validate how many are created
+  int rc = ARES_SUCCESS;
+  ares_set_socket_callback(channel_, SocketConnectCallback, &rc);
+  sock_cb_count = 0;
+
+  HostResult result[LOTSOFCONNECTIONS_CNT];
+  for (size_t i=0; i<LOTSOFCONNECTIONS_CNT; i++) {
+    ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result[i]);
+  }
+
+  Process();
+
+  EXPECT_EQ(LOTSOFCONNECTIONS_CNT, sock_cb_count);
+
+  for (size_t i=0; i<LOTSOFCONNECTIONS_CNT; i++) {
+    std::stringstream ss;
+    EXPECT_TRUE(result[i].done_);
+    ss << result[i].host_;
+    EXPECT_EQ("{'www.google.com' aliases=[] addrs=[2.3.4.5]}", ss.str());
+  }
+}
+#endif
 
 class CacheQueriesEventThreadTest
     : public MockEventThreadOptsTest,
@@ -325,7 +411,7 @@ TEST_P(MockTCPEventThreadTest, MalformedResponse) {
   ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result);
   Process();
   EXPECT_TRUE(result.done_);
-  EXPECT_EQ(ARES_ETIMEOUT, result.status_);
+  EXPECT_EQ(ARES_EBADRESP, result.status_);
 }
 
 TEST_P(MockTCPEventThreadTest, FormErrResponse) {
@@ -766,7 +852,6 @@ TEST_P(MockEventThreadTest, DestroyQuick) {
   EXPECT_TRUE(result.done_);
 }
 
-#ifndef CARES_SYMBOL_HIDING
 // Test case for Issue #662
 TEST_P(MockEventThreadTest, PartialQueryCancel) {
   std::vector<byte> nothing;
@@ -818,16 +903,14 @@ TEST_P(MockEventThreadTest, BulkCancel) {
     for (size_t i = 0; i<BULKCANCEL_CNT; i++) {
       EXPECT_TRUE(result[i].done_);
       EXPECT_TRUE(result[i].status_ == ARES_ECANCELLED || result[i].status_ == ARES_SUCCESS);
-      if (result[i].status_ == ARES_SUCCESS)
+      if (result[i].done_ && result[i].status_ == ARES_SUCCESS)
         success_cnt++;
-      if (result[i].status_ == ARES_ECANCELLED)
+      if (result[i].done_ && result[i].status_ == ARES_ECANCELLED)
         cancel_cnt++;
     }
     if (verbose) std::cerr << "success: " << success_cnt << ", cancel: " << cancel_cnt << std::endl;
   }
 }
-#endif
-
 
 TEST_P(MockEventThreadTest, UnspecifiedFamilyV6) {
   DNSPacket rsp6;
@@ -1213,20 +1296,6 @@ class NoRotateMultiMockEventThreadTest : public MockMultiServerEventThreadTest {
   NoRotateMultiMockEventThreadTest() : MockMultiServerEventThreadTest(nullptr, ARES_OPT_NOROTATE) {}
 };
 
-class ServerFailoverOptsMockEventThreadTest : public MockMultiServerEventThreadTest {
- public:
-  ServerFailoverOptsMockEventThreadTest()
-    : MockMultiServerEventThreadTest(FillOptions(&opts_),
-                                     ARES_OPT_SERVER_FAILOVER | ARES_OPT_NOROTATE) {}
-  static struct ares_options* FillOptions(struct ares_options *opts) {
-    memset(opts, 0, sizeof(struct ares_options));
-    opts->server_failover_opts.retry_chance = 1;
-    opts->server_failover_opts.retry_delay = 250;
-    return opts;
-  }
- private:
-  struct ares_options opts_;
-};
 
 TEST_P(NoRotateMultiMockEventThreadTest, ThirdServer) {
   struct ares_options opts;
@@ -1347,8 +1416,28 @@ TEST_P(NoRotateMultiMockEventThreadTest, ServerNoResponseFailover) {
   EXPECT_EQ("{'www.example.com' aliases=[] addrs=[2.3.4.5]}", ss4.str());
 }
 
+#if defined(_WIN32)
+#  define SERVER_FAILOVER_RETRY_DELAY 500
+#else
+#  define SERVER_FAILOVER_RETRY_DELAY 330
+#endif
+class ServerFailoverOptsMockEventThreadTest : public MockMultiServerEventThreadTest {
+ public:
+  ServerFailoverOptsMockEventThreadTest()
+    : MockMultiServerEventThreadTest(FillOptions(&opts_),
+                                     ARES_OPT_SERVER_FAILOVER | ARES_OPT_NOROTATE) {}
+  static struct ares_options* FillOptions(struct ares_options *opts) {
+    memset(opts, 0, sizeof(struct ares_options));
+    opts->server_failover_opts.retry_chance = 1;
+    opts->server_failover_opts.retry_delay = SERVER_FAILOVER_RETRY_DELAY;
+    return opts;
+  }
+ private:
+  struct ares_options opts_;
+};
+
 // Test case to trigger server failover behavior. We use a retry chance of
-// 100% and a retry delay of 250ms so that we can test behavior reliably.
+// 100% and a retry delay so that we can test behavior reliably.
 TEST_P(ServerFailoverOptsMockEventThreadTest, ServerFailoverOpts) {
   DNSPacket servfailrsp;
   servfailrsp.set_response().set_aa().set_rcode(SERVFAIL)
@@ -1358,7 +1447,12 @@ TEST_P(ServerFailoverOptsMockEventThreadTest, ServerFailoverOpts) {
     .add_question(new DNSQuestion("www.example.com", T_A))
     .add_answer(new DNSARR("www.example.com", 100, {2,3,4,5}));
 
+  auto tv_begin = std::chrono::high_resolution_clock::now();
+  auto tv_now   = std::chrono::high_resolution_clock::now();
+  unsigned int delay_ms;
+
   // 1. If all servers are healthy, then the first server should be selected.
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: First server should be selected" << std::endl;
   EXPECT_CALL(*servers_[0], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[0].get(), &okrsp));
   CheckExample();
@@ -1366,16 +1460,23 @@ TEST_P(ServerFailoverOptsMockEventThreadTest, ServerFailoverOpts) {
   // 2. Failed servers should be retried after the retry delay.
   //
   // Fail server #0 but leave server #1 as healthy.
+  tv_now = std::chrono::high_resolution_clock::now();
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: Server0 will fail but leave Server1 as healthy" << std::endl;
   EXPECT_CALL(*servers_[0], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[0].get(), &servfailrsp));
   EXPECT_CALL(*servers_[1], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[1].get(), &okrsp));
   CheckExample();
 
-  // Sleep for the retry delay (actually a little more than 250ms to account
+  // Sleep for the retry delay (actually a little more than the retry delay to account
   // for unreliable timing, e.g. NTP slew) and send in another query. Server #0
   // should be retried.
-  std::this_thread::sleep_for(std::chrono::milliseconds(260));
+  tv_now = std::chrono::high_resolution_clock::now();
+  delay_ms = SERVER_FAILOVER_RETRY_DELAY + (SERVER_FAILOVER_RETRY_DELAY / 10);
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: sleep " << delay_ms << "ms" << std::endl;
+  ares_sleep_time(delay_ms);
+  tv_now = std::chrono::high_resolution_clock::now();
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: Server0 should be past retry delay and should be tried again successfully" << std::endl;
   EXPECT_CALL(*servers_[0], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[0].get(), &okrsp));
   CheckExample();
@@ -1385,6 +1486,8 @@ TEST_P(ServerFailoverOptsMockEventThreadTest, ServerFailoverOpts) {
   //
   // Fail all servers for the first round of tries. On the second round server
   // #1 responds successfully.
+  tv_now = std::chrono::high_resolution_clock::now();
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: All 3 servers will fail on the first attempt. On second attempt, Server0 will fail, but Server1 will answer correctly." << std::endl;
   EXPECT_CALL(*servers_[0], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[0].get(), &servfailrsp))
     .WillOnce(SetReply(servers_[0].get(), &servfailrsp));
@@ -1398,20 +1501,36 @@ TEST_P(ServerFailoverOptsMockEventThreadTest, ServerFailoverOpts) {
   // At this point the sorted servers look like [1] (f0) [2] (f1) [0] (f2).
   // Sleep for the retry delay and send in another query. Server #2 should be
   // retried first, and then server #0.
-  std::this_thread::sleep_for(std::chrono::milliseconds(260));
+  tv_now = std::chrono::high_resolution_clock::now();
+  delay_ms = SERVER_FAILOVER_RETRY_DELAY + (SERVER_FAILOVER_RETRY_DELAY / 10);
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: sleep " << delay_ms << "ms" << std::endl;
+  ares_sleep_time(delay_ms);
+  tv_now = std::chrono::high_resolution_clock::now();
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: Past retry delay, so will choose Server2 and Server0 that are down. Server2 will fail but Server0 will succeed." << std::endl;
   EXPECT_CALL(*servers_[2], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[2].get(), &servfailrsp));
   EXPECT_CALL(*servers_[0], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[0].get(), &okrsp));
   CheckExample();
 
+  // Test might take a while to run and the sleep may not be accurate, so we
+  // want to track this interval otherwise we may not pass the last test case
+  // on slow systems.
+  auto elapse_start = tv_now;
+
   // 4. If there are multiple failed servers, then servers which have not yet
   //    met the retry delay should be skipped.
   //
   // The sorted servers currently look like [0] (f0) [1] (f0) [2] (f2) and
   // server #2 has just been retried.
-  // Sleep for half the retry delay and trigger a failure on server #0.
-  std::this_thread::sleep_for(std::chrono::milliseconds(130));
+  // Sleep for 1/2 the retry delay and trigger a failure on server #0.
+  tv_now = std::chrono::high_resolution_clock::now();
+  delay_ms = (SERVER_FAILOVER_RETRY_DELAY/2);
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: sleep " << delay_ms << "ms" << std::endl;
+  ares_sleep_time(delay_ms);
+  tv_now = std::chrono::high_resolution_clock::now();
+
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: Retry delay has not been hit yet. Server0 was last successful, so should be tried first (and will fail), Server1 is also healthy so will respond." << std::endl;
   EXPECT_CALL(*servers_[0], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[0].get(), &servfailrsp));
   EXPECT_CALL(*servers_[1], OnRequest("www.example.com", T_A))
@@ -1419,10 +1538,22 @@ TEST_P(ServerFailoverOptsMockEventThreadTest, ServerFailoverOpts) {
   CheckExample();
 
   // The sorted servers now look like [1] (f0) [0] (f1) [2] (f2). Server #0
-  // has just failed whilst server #2 is halfway through the retry delay.
-  // Sleep for another half the retry delay and check that server #2 is retried
-  // whilst server #0 is not.
-  std::this_thread::sleep_for(std::chrono::milliseconds(130));
+  // has just failed whilst server #2 is somewhere in its retry delay.
+  // Sleep until we know server #2s retry delay has elapsed but Server #0 has
+  // not.
+  tv_now = std::chrono::high_resolution_clock::now();
+
+  unsigned int elapsed_time = (unsigned int)std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - elapse_start).count();
+  delay_ms = (SERVER_FAILOVER_RETRY_DELAY) + (SERVER_FAILOVER_RETRY_DELAY / 10);
+  if (elapsed_time > delay_ms) {
+    if (verbose) std::cerr << "elapsed duration " << elapsed_time << "ms greater than desired delay of " << delay_ms << "ms, not sleeping" << std::endl;
+  } else {
+    delay_ms -= elapsed_time; // subtract already elapsed time
+    if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: sleep " << delay_ms << "ms" << std::endl;
+    ares_sleep_time(delay_ms);
+  }
+  tv_now = std::chrono::high_resolution_clock::now();
+  if (verbose) std::cerr << std::chrono::duration_cast<std::chrono::milliseconds>(tv_now - tv_begin).count() << "ms: Retry delay has expired on Server2 but not Server0, will try on Server2 and fail, then Server1 will answer" << std::endl;
   EXPECT_CALL(*servers_[2], OnRequest("www.example.com", T_A))
     .WillOnce(SetReply(servers_[2].get(), &servfailrsp));
   EXPECT_CALL(*servers_[1], OnRequest("www.example.com", T_A))
@@ -1493,6 +1624,10 @@ INSTANTIATE_TEST_SUITE_P(AddressFamilies, MockEDNSEventThreadTest, ::testing::Va
 INSTANTIATE_TEST_SUITE_P(TransportModes, NoRotateMultiMockEventThreadTest, ::testing::ValuesIn(ares::test::evsys_families_modes), ares::test::PrintEvsysFamilyMode);
 
 INSTANTIATE_TEST_SUITE_P(TransportModes, ServerFailoverOptsMockEventThreadTest, ::testing::ValuesIn(ares::test::evsys_families_modes), ares::test::PrintEvsysFamilyMode);
+
+#if 0
+INSTANTIATE_TEST_SUITE_P(AddressFamilies, MockUDPEventThreadSingleQueryPerConnTest, ::testing::ValuesIn(ares::test::evsys_families), ares::test::PrintEvsysFamily);
+#endif
 
 }  // namespace test
 }  // namespace ares
